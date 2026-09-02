@@ -1,5 +1,7 @@
 # docker-mac-x64
 
+[![macOS x64 smoke test](https://github.com/zackees/docker-mac-x64/actions/workflows/macos-x64.yml/badge.svg)](https://github.com/zackees/docker-mac-x64/actions/workflows/macos-x64.yml)
+
 Run an **x86_64 macOS** guest in Docker on a Linux host, and execute Intel-Mac
 binaries in it — without owning an Intel Mac and without waiting on a
 `macos-*-intel` CI runner.
@@ -186,6 +188,72 @@ instead and needs the two-command handoff, because OpenCore has written NVRAM
 into the container writable layer by then. Prefer `docker rm` + `docker run`, or
 just use snapshots and never boot twice.
 
+
+## Use as a GitHub Action
+
+Run commands on a real x86_64 macOS guest from a stock `ubuntu-latest` runner —
+no macOS runner minutes, no Apple hardware.
+
+```yaml
+- uses: zackees/docker-mac-x64@main
+  id: macos
+  with:
+    share-dir: share          # files served to the guest at http://10.0.2.2:8000/<name>
+    run: |
+      curl -s -o /tmp/prog http://10.0.2.2:8000/prog
+      chmod +x /tmp/prog
+      /tmp/prog --version
+
+- run: echo "guest rc=${{ steps.macos.outputs.exit-code }}"
+```
+
+| Input | Default | |
+|---|---|---|
+| `run` | *(required)* | shell script executed in the guest, as root |
+| `share-dir` | `''` | directory served to the guest over HTTP |
+| `image` | `etasdemir/osx-container:ventura` | |
+| `ram` / `cores` / `threads` | `6` / `2` / `4` | |
+| `free-disk-space` | `true` | reclaims ~20 GB before pulling |
+
+Outputs: `exit-code`, `stdout`, and `workdir` (holds `results/` with the guest
+output plus `final.ppm` / `fail.ppm` screendumps — upload it as an artifact,
+it is your only view into a failed boot).
+
+### How commands and results actually move
+
+Not screen-scraping. The driver runs *inside* the container, which is the guest's
+slirp host (`10.0.2.2`), and serves an HTTP endpoint. It types a short bootstrap
+line into the Recovery Terminal; the guest then fetches the real script and
+**POSTs stdout and the true exit code back**. The arrival of that POST is also
+the oracle that the keystrokes landed in a shell at all — if it never arrives,
+the driver reopens Terminal and retries.
+
+The driver is stdlib-only and reads the framebuffer straight from QEMU's PPM
+header, so the runner needs no ImageMagick and no `bc`.
+
+### Two things that make headless boot reliable
+
+**Never key on framebuffer width alone.** It flips to 1920x1080 while the screen
+is still fully black, *seconds* before OpenCore paints the picker. Arrow/Enter
+sent into that gap go nowhere, the picker then auto-boots its default (the wrong
+entry) after 45 s, and you get a black screen that looks like a kernel panic.
+Measured signatures the driver uses instead:
+
+| Screen | Width | Mean brightness |
+|---|---|---|
+| Black / not yet painted | any | `0.0000` |
+| OpenCore picker, painted | 1920 | `~0.0121` |
+| UEFI Shell | 1024 | `~0.0193` |
+| Recovery desktop | 1024 | `0.09`–`0.13` |
+
+**Never use RSS as a UI-ready signal.** It crosses any threshold well before
+Recovery accepts input, so `⇧⌘T` lands in whatever dialog is up — twice it
+opened "Restore from Time Machine" instead of Terminal. The driver waits for
+three consecutive byte-identical desktop frames, then 15 s more.
+
+Every miss is recoverable: the driver `system_reset`s and retries the whole
+picker sequence up to 3 times.
+
 ## Running a Mac binary without installing macOS
 
 Recovery ships a full userland, so `Utilities > Terminal` is enough to execute an
@@ -254,7 +322,9 @@ Being explicit, because "it works" claims about macOS-in-Docker age badly:
 | `hostfwd` ssh forward reaches a guest sshd | **Not verified** — needs a full install with Remote Login on |
 | `Dockerfile` builds from scratch | **Not verified** — the prebuilt image is what was tested |
 | Keyboard `bus=ehci.0` binding | **Not isolated** — changed together with the display fix |
-| Intel hosts | Untested; only AMD Ryzen was exercised |
+| Headless driver: boot -> run -> real exit code, no OCR | Verified locally (153 s, rc=0) |
+| Runs on a GitHub-hosted `ubuntu-latest` runner | See the badge above |
+| Intel hosts | Only AMD Ryzen exercised locally; CI runners are Intel/EPYC |
 
 ## Requirements
 

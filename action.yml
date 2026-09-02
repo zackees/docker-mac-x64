@@ -1,0 +1,161 @@
+name: 'macOS x64 runner'
+description: 'Run shell commands on a real x86_64 macOS guest, on a Linux runner, via KVM.'
+branding:
+  icon: 'terminal'
+  color: 'gray-dark'
+
+inputs:
+  run:
+    description: 'Shell script to execute inside the macOS guest. Runs as root in Recovery.'
+    required: true
+  share-dir:
+    description: 'Directory whose files are served to the guest at http://10.0.2.2:8000/<name>'
+    required: false
+    default: ''
+  image:
+    description: 'Container image carrying OSX-KVM + a macOS recovery image'
+    required: false
+    default: 'etasdemir/osx-container:ventura'
+  ram:
+    description: 'Guest RAM in GB'
+    required: false
+    default: '6'
+  cores:
+    description: 'Guest CPU cores'
+    required: false
+    default: '2'
+  threads:
+    description: 'Guest CPU threads'
+    required: false
+    default: '4'
+  free-disk-space:
+    description: 'Reclaim ~20GB from the runner before pulling the image'
+    required: false
+    default: 'true'
+  boot-timeout:
+    description: 'Seconds to wait for the macOS desktop'
+    required: false
+    default: '900'
+  run-timeout:
+    description: 'Seconds to wait for the guest to report a result'
+    required: false
+    default: '900'
+
+outputs:
+  exit-code:
+    description: 'Exit code of the script inside the guest'
+    value: ${{ steps.drive.outputs.exit-code }}
+  stdout:
+    description: 'Stdout+stderr captured inside the guest'
+    value: ${{ steps.drive.outputs.stdout }}
+  workdir:
+    description: 'Directory holding results/ (stdout, rc, final.ppm, fail.ppm)'
+    value: ${{ steps.prep.outputs.workdir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Enable /dev/kvm
+      shell: bash
+      run: |
+        set -euo pipefail
+        # GitHub-hosted Ubuntu runners expose KVM, but the device is not
+        # world-accessible until this udev rule is installed.
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+        ls -la /dev/kvm
+        test -c /dev/kvm || { echo "::error::/dev/kvm is not available on this runner"; exit 1; }
+
+    - name: Free disk space
+      if: inputs.free-disk-space == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        echo "before:"; df -h / | tail -1
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+        docker system prune -af >/dev/null 2>&1 || true
+        echo "after:"; df -h / | tail -1
+
+    - name: Prepare working directories
+      id: prep
+      shell: bash
+      run: |
+        set -euo pipefail
+        WORK="${RUNNER_TEMP}/macos-x64"
+        # 777 is deliberate: the runner user is uid 1001 but the container runs
+        # as uid 1000, so anything less permissive makes qemu-img and the
+        # driver fail with EACCES on these bind mounts.
+        mkdir -m 777 -p "$WORK/disk" "$WORK/share" "$WORK/results" "$WORK/work"
+        printf '%s\n' "$INPUT_RUN" > "$WORK/work/run.sh"
+        chmod 666 "$WORK/work/run.sh"
+        if [ -n "$INPUT_SHARE" ] && [ -d "$INPUT_SHARE" ]; then
+          cp -r "$INPUT_SHARE"/. "$WORK/share"/
+          chmod -R a+rX "$WORK/share"
+        fi
+        echo "workdir=$WORK" >> "$GITHUB_OUTPUT"
+        echo "--- guest script ---"; cat "$WORK/work/run.sh"; echo "--------------------"
+      env:
+        INPUT_RUN: ${{ inputs.run }}
+        INPUT_SHARE: ${{ inputs.share-dir }}
+
+    - name: Pull image
+      shell: bash
+      run: |
+        set -uo pipefail
+        # Anonymous Docker Hub pulls are rate limited per IP and runners share
+        # egress IPs, so a single failure here is a flake, not a real error.
+        for i in 1 2 3; do
+          docker pull "$IMAGE" && exit 0
+          echo "pull attempt $i failed; retrying in 20s"; sleep 20
+        done
+        echo "::error::could not pull $IMAGE"; exit 1
+      env:
+        IMAGE: ${{ inputs.image }}
+
+    - name: Boot macOS and run the script
+      id: drive
+      shell: bash
+      run: |
+        set -uo pipefail
+        WORK="${{ steps.prep.outputs.workdir }}"
+        ACTION_PATH="${{ github.action_path }}"
+
+        docker run --rm -v "$WORK/disk:/disk" --entrypoint qemu-img "$IMAGE" \
+          create -f qcow2 /disk/mac_hdd_ng.img 64G
+
+        docker rm -f macos-x64 >/dev/null 2>&1 || true
+        docker run -d --name macos-x64 --device /dev/kvm \
+          -e RAM="$RAM" -e CORES="$CORES" -e THREADS="$THREADS" -e DISPLAY_MODE=vnc \
+          -v "$ACTION_PATH/Launch.sh:/home/user/OSX-KVM/Launch.sh:ro" \
+          -v "$WORK/disk/mac_hdd_ng.img:/home/user/OSX-KVM/mac_hdd_ng.img" \
+          -v "$WORK/share:/share" -v "$WORK/results:/results" -v "$WORK/work:/work" \
+          "$IMAGE"
+
+        docker cp "$ACTION_PATH/scripts/driver.py" macos-x64:/tmp/driver.py
+        set +e
+        docker exec \
+          -e RUN_SCRIPT=/work/run.sh -e SHARE_DIR=/share -e OUT_DIR=/results \
+          -e BOOT_TIMEOUT="$BOOT_TIMEOUT" -e RUN_TIMEOUT="$RUN_TIMEOUT" \
+          macos-x64 python3 /tmp/driver.py
+        DRC=$?
+        set -e
+
+        RC="$(cat "$WORK/results/rc" 2>/dev/null || echo "$DRC")"
+        echo "exit-code=$RC" >> "$GITHUB_OUTPUT"
+        {
+          echo 'stdout<<GUEST_STDOUT_EOF'
+          cat "$WORK/results/stdout" 2>/dev/null || true
+          echo 'GUEST_STDOUT_EOF'
+        } >> "$GITHUB_OUTPUT"
+        docker rm -f macos-x64 >/dev/null 2>&1 || true
+        exit "$DRC"
+      env:
+        IMAGE: ${{ inputs.image }}
+        RAM: ${{ inputs.ram }}
+        CORES: ${{ inputs.cores }}
+        THREADS: ${{ inputs.threads }}
+        BOOT_TIMEOUT: ${{ inputs.boot-timeout }}
+        RUN_TIMEOUT: ${{ inputs.run-timeout }}

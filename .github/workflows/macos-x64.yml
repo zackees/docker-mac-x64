@@ -1,0 +1,77 @@
+# Proves the action works on a stock GitHub-hosted Linux runner: boots a real
+# x86_64 macOS guest under KVM and runs `soldr --version` in it.
+name: macOS x64 smoke test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  soldr-version:
+    name: soldr --version on macOS x86_64
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SOLDR_VERSION: v0.9.11
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the macOS x86_64 build of soldr
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq zstd
+          mkdir -p share
+          URL="https://github.com/zackees/soldr/releases/download/${SOLDR_VERSION}/soldr-${SOLDR_VERSION}-x86_64-apple-darwin.tar.zst"
+          echo "downloading $URL"
+          curl -fsSL "$URL" -o soldr.tar.zst
+          tar --zstd -xf soldr.tar.zst -C share soldr
+          chmod 755 share/soldr
+          ls -la share/
+          # Prove on the Linux side that this really is an Intel-Mac binary
+          # before we ever boot the guest: cf fa ed fe = MH_MAGIC_64,
+          # 07 00 00 01 = CPU_TYPE_X86_64.
+          MAGIC="$(od -A n -t x1 -N 8 share/soldr | tr -s ' ' | sed 's/^ //')"
+          echo "Mach-O magic: $MAGIC"
+          test "$MAGIC" = "cf fa ed fe 07 00 00 01" \
+            || { echo "::error::share/soldr is not an x86_64 Mach-O"; exit 1; }
+
+      - name: Run soldr --version inside macOS
+        id: macos
+        uses: ./
+        with:
+          share-dir: share
+          run: |
+            set -e
+            curl -s -o /tmp/soldr http://10.0.2.2:8000/soldr
+            chmod +x /tmp/soldr
+            echo "--- guest identity ---"
+            uname -a
+            sw_vers 2>/dev/null || true
+            echo "--- soldr ---"
+            /tmp/soldr --version
+
+      - name: Assert the guest really ran it
+        run: |
+          set -euo pipefail
+          echo "guest exit code: ${{ steps.macos.outputs.exit-code }}"
+          cat <<'GUEST'
+          ${{ steps.macos.outputs.stdout }}
+          GUEST
+          test "${{ steps.macos.outputs.exit-code }}" = "0" \
+            || { echo "::error::guest returned non-zero"; exit 1; }
+          printf '%s' "${{ steps.macos.outputs.stdout }}" | grep -q 'soldr [0-9]' \
+            || { echo "::error::no soldr version string in guest output"; exit 1; }
+          printf '%s' "${{ steps.macos.outputs.stdout }}" | grep -q 'x86_64' \
+            || { echo "::error::guest did not report x86_64"; exit 1; }
+          echo "PROVEN: soldr ran on x86_64 macOS in a GitHub Action"
+
+      - name: Upload guest screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-guest-screens
+          path: ${{ steps.macos.outputs.workdir }}/results/
+          if-no-files-found: warn
