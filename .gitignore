@@ -1,0 +1,6 @@
+disk/
+*.ppm
+*.png
+*.img
+*.qcow2
+__pycache__/
