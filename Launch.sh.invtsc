@@ -44,12 +44,9 @@ case "${DISPLAY_MODE:-vnc}" in
   *)    echo "DISPLAY_MODE must be vnc|x11|none" >&2; exit 2 ;;
 esac
 
-INCOMING_ARGS=()
-[[ -n "${INCOMING:-}" ]] && INCOMING_ARGS=(-incoming "$INCOMING")
-
 args=(
   -enable-kvm -m "$ALLOCATED_RAM"
-  -cpu Penryn,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on,"$MY_OPTIONS"
+  -cpu Penryn,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,"$MY_OPTIONS"
   -machine q35
   -usb
   -smp "$CPU_THREADS",cores="$CPU_CORES",sockets="$CPU_SOCKETS"
@@ -74,7 +71,7 @@ args=(
   -monitor unix:/home/user/OSX-KVM/monitor.sock,server,nowait
   -device VGA,vgamem_mb="${GPU}"
   "${DISPLAY_ARGS[@]}"
-  "${INCOMING_ARGS[@]}"
+  ${INCOMING:+-incoming "$INCOMING"}
   ${EXTRA_ARGS:-}
 )
 

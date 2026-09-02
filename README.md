@@ -123,6 +123,69 @@ absolute `usb-tablet` ignores, so the cursor cannot be steered. Navigate menus
 with the keyboard: `sendkey ctrl-f2` focuses the macOS menu bar, then arrows and
 `ret`. That is how `Utilities > Terminal` gets opened in Recovery.
 
+
+## Fast resume: snapshot the whole VM to a volume
+
+Booting macOS costs ~80 s and cannot be tuned away -- it is XNU startup, not
+I/O, so a faster disk does not help. What *does* help is never booting: save the
+running VM (RAM and all) to a file on a host volume and resume from it.
+
+| | Time |
+|---|---|
+| Cold: `docker run` -> `soldr --version` output | ~165 s |
+| Save running VM to volume (3.0 GB state file) | 28.8 s |
+| **Restore: `docker run` -> VM running** | **6.2 s** |
+
+Roughly **27x faster**, and the guest comes back *exactly* where it was -- same
+Terminal, same scrollback, binary still in `/tmp`, ready for the next command.
+
+```bash
+./scripts/snapshot.sh save      # guest freezes into state/vm.state
+./scripts/snapshot.sh restore   # back in ~6 s
+```
+
+### The catch: `+invtsc` blocks it
+
+OSX-KVM's CPU line includes `+invtsc`, which marks the vCPU **non-migratable**.
+QEMU then refuses both `migrate` and `savevm`:
+
+```
+Outgoing migration blocked:
+  State blocked by non-migratable CPU device (invtsc flag)
+```
+
+`Launch.sh` here drops `+invtsc`. Ventura boots and runs fine without it (this
+is the configuration all the timings above were measured on). `Launch.sh.invtsc`
+keeps the original if you need it -- but with it you get no fast resume.
+
+The guest clock is frozen at save time, so after a long suspend `date` is stale;
+re-sync in the guest if anything you run cares.
+
+Two other things that trip this up, both fixed here:
+
+* The HMP URI contains a space, so it must be quoted. Unquoted you get
+  `migrate: extraneous characters at the end of line`, no file, and a
+  `Migration status` that never appears -- easy to misread as a slow save.
+* `savevm` (rather than `migrate`) additionally requires every writable block
+  device to support snapshots. `BaseSystem.img` is raw, and marking it
+  read-only fails with `Block node is read-only` because `-device ide-hd`
+  rejects a read-only node. `migrate exec:` sidesteps all of that.
+
+### Cheaper alternative
+
+`docker pause` / `docker unpause` resumes instantly with zero setup, but the
+container must stay alive, it holds the full 8 GB of RAM, and it does not
+survive `docker stop` or a host reboot. Use it for minutes-scale iteration;
+use the snapshot for anything longer.
+
+### A note on boot paths
+
+A **fresh** container (`docker run`) goes straight to the OpenCore picker in
+~3 s. A **restarted** one (`docker stop; docker start`) lands in the UEFI Shell
+instead and needs the two-command handoff, because OpenCore has written NVRAM
+into the container writable layer by then. Prefer `docker rm` + `docker run`, or
+just use snapshots and never boot twice.
+
 ## Running a Mac binary without installing macOS
 
 Recovery ships a full userland, so `Utilities > Terminal` is enough to execute an
