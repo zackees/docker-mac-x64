@@ -26,6 +26,7 @@ RUN_SCRIPT = os.environ.get("RUN_SCRIPT", "/work/run.sh")
 PORT = int(os.environ.get("PORT", "8000"))
 BOOT_TIMEOUT = int(os.environ.get("BOOT_TIMEOUT", "900"))
 RUN_TIMEOUT = int(os.environ.get("RUN_TIMEOUT", "900"))
+COLLECT = os.environ.get("COLLECT", "").strip()
 SHOT = "/tmp/_drv.ppm"
 
 # Measured framebuffer signatures (mean brightness of the PPM payload).
@@ -187,7 +188,7 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(n) if n else b""
         name = os.path.basename(self.path.lstrip("/")) or "post"
-        if name not in ("stdout", "rc"):
+        if name not in ("stdout", "rc", "collect.tar.gz"):
             name = "post"
         with open(os.path.join(OUT, name), "wb") as f:
             f.write(body)
@@ -328,17 +329,38 @@ def main():
         user_script = f.read()
     with open(os.path.join(SHARE, "user.sh"), "w") as f:
         f.write(user_script)
+    # Optional: tar a directory in the guest and POST it back, so results
+    # (JUnit XML, JSON) survive the guest being torn down. Sent BEFORE rc,
+    # because rc is what the driver waits on -- posting it last would race.
+    collect_snippet = ""
+    if COLLECT:
+        collect_snippet = (
+            "tar -czf /tmp/collect.tar.gz -C %s . 2>/dev/null || true\n"
+            "curl -s -X POST --data-binary @/tmp/collect.tar.gz "
+            "http://10.0.2.2:%d/collect.tar.gz || true\n" % (COLLECT, PORT)
+        )
+
     # Guest-side wrapper: capture output + real rc, then POST both back.
     # Recovery ships bash 3.2 -- keep this portable.
     with open(os.path.join(SHARE, "run.sh"), "w") as f:
-        f.write(
-            "#!/bin/sh\n"
-            "curl -s -o /tmp/user.sh http://10.0.2.2:%d/user.sh || exit 90\n"
-            "sh /tmp/user.sh > /tmp/out 2>&1; echo $? > /tmp/rc\n"
-            "curl -s -X POST --data-binary @/tmp/out http://10.0.2.2:%d/stdout\n"
-            "curl -s -X POST --data-binary @/tmp/rc http://10.0.2.2:%d/rc\n"
-            % (PORT, PORT, PORT)
-        )
+        lines = [
+            "#!/bin/sh",
+            "curl -s -o /tmp/user.sh http://10.0.2.2:{p}/user.sh || exit 90".format(p=PORT),
+            "sh /tmp/user.sh > /tmp/out 2>&1; echo $? > /tmp/rc",
+        ]
+        if COLLECT:
+            lines += [
+                "tar -czf /tmp/collect.tar.gz -C {c} . 2>/dev/null || true".format(c=COLLECT),
+                "curl -s -X POST --data-binary @/tmp/collect.tar.gz "
+                "http://10.0.2.2:{p}/collect.tar.gz || true".format(p=PORT),
+            ]
+        lines += [
+            "curl -s -X POST --data-binary @/tmp/out http://10.0.2.2:{p}/stdout".format(p=PORT),
+            # rc goes LAST: it is what the driver waits on, so posting it before
+            # the collected results would race the tarball.
+            "curl -s -X POST --data-binary @/tmp/rc http://10.0.2.2:{p}/rc".format(p=PORT),
+        ]
+        f.write("\n".join(lines) + "\n")
 
     serve()
     mon = Monitor()
@@ -381,6 +403,11 @@ def main():
     if not os.path.exists(rc_path):
         log("FAIL: guest never posted a result")
         return 6
+
+    cp = os.path.join(OUT, "collect.tar.gz")
+    if COLLECT:
+        log("collected %s (%s bytes)" % (COLLECT, os.path.getsize(cp)) if os.path.exists(cp)
+            else "WARNING: nothing collected from %s" % COLLECT)
 
     rc = open(rc_path).read().strip()
     out = ""

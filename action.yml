@@ -32,6 +32,10 @@ inputs:
     description: 'Reclaim ~20GB from the runner before pulling the image'
     required: false
     default: 'true'
+  collect:
+    description: 'Directory inside the guest to tar up and bring back (lands in <workdir>/collected/)'
+    required: false
+    default: ''
   boot-timeout:
     description: 'Seconds to wait for the macOS desktop'
     required: false
@@ -139,9 +143,16 @@ runs:
         docker exec \
           -e RUN_SCRIPT=/work/run.sh -e SHARE_DIR=/share -e OUT_DIR=/results \
           -e BOOT_TIMEOUT="$BOOT_TIMEOUT" -e RUN_TIMEOUT="$RUN_TIMEOUT" \
+          -e COLLECT="$COLLECT" \
           macos-x64 python3 /tmp/driver.py
         DRC=$?
         set -e
+
+        if [ -n "$COLLECT" ] && [ -f "$WORK/results/collect.tar.gz" ]; then
+          mkdir -p "$WORK/collected"
+          tar -C "$WORK/collected" -xzf "$WORK/results/collect.tar.gz"
+          echo "collected from guest:"; ls -R "$WORK/collected" | head -40
+        fi
 
         RC="$(cat "$WORK/results/rc" 2>/dev/null || echo "$DRC")"
         echo "exit-code=$RC" >> "$GITHUB_OUTPUT"
@@ -157,5 +168,6 @@ runs:
         RAM: ${{ inputs.ram }}
         CORES: ${{ inputs.cores }}
         THREADS: ${{ inputs.threads }}
+        COLLECT: ${{ inputs.collect }}
         BOOT_TIMEOUT: ${{ inputs.boot-timeout }}
         RUN_TIMEOUT: ${{ inputs.run-timeout }}
