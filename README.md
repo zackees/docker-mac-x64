@@ -252,7 +252,26 @@ opened "Restore from Time Machine" instead of Terminal. The driver waits for
 three consecutive byte-identical desktop frames, then 15 s more.
 
 Every miss is recoverable: the driver `system_reset`s and retries the whole
-picker sequence up to 3 times.
+picker sequence up to 3 times. **This is not theoretical** — on the very first
+CI run, boot attempt 1 typed the UEFI-Shell handoff and the picker never
+painted; the reset-and-retry is the only reason the run went green:
+
+```
+[   14.0s] boot attempt 1
+[   19.1s]   UEFI Shell -> handing off to OpenCore
+[  255.5s]   no painted picker; resetting
+[  261.6s] boot attempt 2
+[  263.1s]   picker painted
+[  268.2s]   highlight moved (attempt 1)
+[  322.5s] Recovery desktop ready
+[  371.5s] guest exit code 0
+soldr 0.9.11
+```
+
+Measured on `ubuntu-latest` (4 vCPU, nested virt): ~6 min for the driver
+including one failed attempt, ~9.5 min for the whole job. Locally on a Ryzen
+7 3700X the same driver takes 154 s. Budget accordingly — do not tune timeouts
+to local numbers.
 
 ## Running a Mac binary without installing macOS
 

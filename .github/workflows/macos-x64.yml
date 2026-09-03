@@ -5,6 +5,7 @@ name: macOS x64 smoke test
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md']
   pull_request:
   workflow_dispatch:
 
