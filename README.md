@@ -231,6 +231,43 @@ the driver reopens Terminal and retries.
 The driver is stdlib-only and reads the framebuffer straight from QEMU's PPM
 header, so the runner needs no ImageMagick and no `bc`.
 
+### Failing fast when the keystrokes miss (issue #1)
+
+The bootstrap is typed into a GUI Terminal, so it can miss. When it does, the
+Recovery window still has focus — and its default button is **Restore from Time
+Machine**, so a blind Enter launches the restore assistant and nothing runs. The
+driver used to wait the entire `run-timeout` (3600 s) for a result that could
+never come, then retry four more times with no new information: **68 minutes to
+report "no result"**, with no screenshot to say why.
+
+Three changes, in order of how much they help:
+
+1. **Don't type unless Terminal actually opened.** Opening it repaints most of
+   the screen; an unchanged frame after `⇧⌘T` means the shortcut did not
+   register, so the driver skips typing entirely rather than firing Enter at
+   whatever dialog has focus.
+2. **A start marker.** The guest wrapper POSTs `/started` as its very first
+   action, before anything that can fail. "Did the typed line reach a shell?"
+   (`start-timeout`, 120 s, retryable) is now a different question from "is the
+   payload still working?" (`run-timeout`) — the conflation of those two is the
+   whole bug.
+3. **A heartbeat.** A background loop POSTs the tail of the live output every
+   20 s. It drives `no-progress-timeout` (900 s) so a wedged payload cannot sit
+   out the full `run-timeout` in silence, and the tail is echoed into the driver
+   log so a hang shows *which step* it stopped at.
+
+Retries stop once the script has provably started — retyping a command at a
+guest that is already half-way through a run only makes it worse. Every miss
+writes a `.ppm` screendump to `<workdir>/results/`; upload that directory as an
+artifact and a failure explains itself.
+
+Measured against a guest where Terminal deliberately never opens:
+
+| | before | after |
+|---|---|---|
+| time to report the failure | ~68 min (3600 s + 4x120 s) | **~7.5 min** (3x148 s) |
+| diagnostics | none | 3 screendumps naming the window that ate the keys |
+
 ### Two things that make headless boot reliable
 
 **Never key on framebuffer width alone.** It flips to 1920x1080 while the screen

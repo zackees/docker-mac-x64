@@ -27,6 +27,15 @@ PORT = int(os.environ.get("PORT", "8000"))
 BOOT_TIMEOUT = int(os.environ.get("BOOT_TIMEOUT", "900"))
 RUN_TIMEOUT = int(os.environ.get("RUN_TIMEOUT", "900"))
 COLLECT = os.environ.get("COLLECT", "").strip()
+# RUN_TIMEOUT alone cannot tell "the keystrokes never reached a shell" from
+# "the payload is still working", so a typing miss used to burn the whole
+# budget before the first retry (issue #1: 3600 s of nothing). These split it:
+#   START_TIMEOUT       how long a typed command gets to prove it ran at all
+#   NO_PROGRESS_TIMEOUT how long a *running* script may produce no new output
+START_TIMEOUT = int(os.environ.get("START_TIMEOUT", "120"))
+NO_PROGRESS_TIMEOUT = int(os.environ.get("NO_PROGRESS_TIMEOUT", "900"))
+HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "20"))
+ATTEMPTS = int(os.environ.get("TERMINAL_ATTEMPTS", "3"))
 SHOT = "/tmp/_drv.ppm"
 
 # Measured framebuffer signatures (mean brightness of the PPM payload).
@@ -188,7 +197,7 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(n) if n else b""
         name = os.path.basename(self.path.lstrip("/")) or "post"
-        if name not in ("stdout", "rc", "collect.tar.gz"):
+        if name not in ("stdout", "rc", "collect.tar.gz", "started", "heartbeat"):
             name = "post"
         with open(os.path.join(OUT, name), "wb") as f:
             f.write(body)
@@ -345,8 +354,24 @@ def main():
     with open(os.path.join(SHARE, "run.sh"), "w") as f:
         lines = [
             "#!/bin/sh",
+            # FIRST, before anything that can fail: proof the typed line reached
+            # a shell. Without this the driver cannot tell a typing miss from a
+            # slow payload, which is issue #1.
+            "curl -s -X POST --data-binary started "
+            "http://10.0.2.2:{p}/started".format(p=PORT),
             "curl -s -o /tmp/user.sh http://10.0.2.2:{p}/user.sh || exit 90".format(p=PORT),
+            # Background heartbeat carrying the tail of the live output, so a
+            # hang shows WHICH step stopped instead of just going quiet.
+            ": > /tmp/out",
+            "( while : ; do",
+            "    tail -c 4000 /tmp/out > /tmp/hb 2>/dev/null || : > /tmp/hb",
+            "    curl -s -X POST --data-binary @/tmp/hb "
+            "http://10.0.2.2:{p}/heartbeat".format(p=PORT),
+            "    sleep {i}".format(i=HEARTBEAT_INTERVAL),
+            "  done ) &",
+            "_hb=$!",
             "sh /tmp/user.sh > /tmp/out 2>&1; echo $? > /tmp/rc",
+            "kill $_hb 2>/dev/null",
         ]
         if COLLECT:
             lines += [
@@ -377,27 +402,114 @@ def main():
     log("Recovery desktop ready")
     time.sleep(15)
 
-    # Open Terminal and bootstrap. The POST arriving is the oracle that the
-    # keystrokes actually landed in a shell -- so a miss just means retry.
+    # Open Terminal and bootstrap. Two distinct waits, because they fail for
+    # completely different reasons and only one of them is worth retrying:
+    #
+    #   1. Did the typed line reach a shell at all?  -> START_TIMEOUT, retryable.
+    #      This is issue #1: Terminal was "opened" but the keystrokes went
+    #      somewhere else (a Recovery dialog can take focus), so nothing ran and
+    #      the old code sat on the full RUN_TIMEOUT -- 3600 s -- before its first
+    #      retry, then retried four more times with no new information.
+    #   2. Is a script that HAS started still making progress? -> heartbeat +
+    #      NO_PROGRESS_TIMEOUT, NOT retryable. Retyping the command at a guest
+    #      that is already half-way through a run only makes the mess worse.
     boot_cmd = ("ipconfig set en0 DHCP; until curl -s -o /tmp/r.sh "
                 "http://10.0.2.2:%d/run.sh; do sleep 2; done; sh /tmp/r.sh" % PORT)
     rc_path = os.path.join(OUT, "rc")
-    for attempt in range(1, 6):
+    started_path = os.path.join(OUT, "started")
+    hb_path = os.path.join(OUT, "heartbeat")
+
+    def hb_tail(n=3):
+        try:
+            with open(hb_path, errors="replace") as f:
+                tail = [ln for ln in f.read().strip().split("\n") if ln.strip()]
+            return " | ".join(tail[-n:])[:300]
+        except OSError:
+            return ""
+
+    started = False
+    for attempt in range(1, ATTEMPTS + 1):
         log("terminal attempt %d" % attempt)
+
+        # Confirm Terminal actually opened BEFORE typing. If it did not, the
+        # Recovery window still has focus and its default button is "Restore
+        # from Time Machine" -- so blindly typing and pressing Enter launches
+        # the restore assistant, which is how issue #1 actually happened (its
+        # no-start screendump shows exactly that window). Opening Terminal
+        # repaints a large part of the screen, so an unchanged frame means the
+        # shortcut did not register and typing would do harm.
+        mon.screendump()
+        _, _, _, before = ppm_stats(SHOT)
         mon.key("shift-meta_l-t")
         time.sleep(12)
+        mon.screendump()
+        _, _, _, after = ppm_stats(SHOT)
+        if before and after and before == after:
+            shot = os.path.join(OUT, "no-terminal-attempt-%d.ppm" % attempt)
+            mon.screendump(shot)
+            log("  Terminal did not open (screen unchanged); NOT typing, to avoid "
+                "hitting the Recovery window's default button. Screen: %s"
+                % os.path.basename(shot))
+            mon.key("esc")
+            time.sleep(8)
+            continue
+
         mon.type(boot_cmd)
         mon.key("ret")
-        deadline = time.time() + (RUN_TIMEOUT if attempt == 1 else 120)
+
+        deadline = time.time() + START_TIMEOUT
         while time.time() < deadline:
-            if os.path.exists(rc_path):
+            if os.path.exists(started_path) or os.path.exists(rc_path):
+                started = True
                 break
             time.sleep(2)
+        if started:
+            log("  guest confirmed the command started")
+            break
+
+        # A screendump here is the whole point: without it there is no way to
+        # tell afterwards WHERE the keystrokes landed.
+        shot = os.path.join(OUT, "no-start-attempt-%d.ppm" % attempt)
+        mon.screendump(shot)
+        log("  no start marker after %ds -- keystrokes did not reach a shell "
+            "(screen saved to %s)" % (START_TIMEOUT, os.path.basename(shot)))
+        mon.key("esc")
+        time.sleep(8)
+
+    if not started:
+        log("FAIL: the run command never started after %d attempts (%ds each)"
+            % (ATTEMPTS, START_TIMEOUT))
+        mon.screendump(os.path.join(OUT, "fail.ppm"))
+        return 6
+
+    # It is running. Wait for rc, but give up if it stops producing output --
+    # a wedged payload should not consume the whole RUN_TIMEOUT in silence.
+    deadline = time.time() + RUN_TIMEOUT
+    last_hb = None
+    last_change = time.time()
+    last_report = 0.0
+    while time.time() < deadline:
         if os.path.exists(rc_path):
             break
-        log("  no result yet; retrying")
-        mon.key("esc")
-        time.sleep(10)
+        try:
+            stamp = os.path.getmtime(hb_path)
+        except OSError:
+            stamp = None
+        if stamp != last_hb:
+            last_hb, last_change = stamp, time.time()
+        quiet = time.time() - last_change
+        if quiet > NO_PROGRESS_TIMEOUT:
+            mon.screendump(os.path.join(OUT, "fail.ppm"))
+            log("FAIL: no output for %ds (last heartbeat: %s)"
+                % (int(quiet), hb_tail() or "<none>"))
+            return 7
+        # Surface progress in the driver log, so a hang shows its last step.
+        if time.time() - last_report > 60:
+            last_report = time.time()
+            t = hb_tail()
+            if t:
+                log("  guest: %s" % t)
+        time.sleep(2)
 
     mon.screendump(os.path.join(OUT, "final.ppm"))
     if not os.path.exists(rc_path):

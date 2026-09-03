@@ -36,6 +36,18 @@ inputs:
     description: 'Directory inside the guest to tar up and bring back (lands in <workdir>/collected/)'
     required: false
     default: ''
+  start-timeout:
+    description: 'Seconds a typed command gets to prove it reached a shell before the driver retries it'
+    required: false
+    default: '120'
+  no-progress-timeout:
+    description: 'Seconds a running guest script may produce no new output before the driver gives up'
+    required: false
+    default: '900'
+  terminal-attempts:
+    description: 'How many times to reopen Terminal and retype the bootstrap'
+    required: false
+    default: '3'
   boot-timeout:
     description: 'Seconds to wait for the macOS desktop'
     required: false
@@ -144,6 +156,9 @@ runs:
           -e RUN_SCRIPT=/work/run.sh -e SHARE_DIR=/share -e OUT_DIR=/results \
           -e BOOT_TIMEOUT="$BOOT_TIMEOUT" -e RUN_TIMEOUT="$RUN_TIMEOUT" \
           -e COLLECT="$COLLECT" \
+          -e START_TIMEOUT="$START_TIMEOUT" \
+          -e NO_PROGRESS_TIMEOUT="$NO_PROGRESS_TIMEOUT" \
+          -e TERMINAL_ATTEMPTS="$TERMINAL_ATTEMPTS" \
           macos-x64 python3 /tmp/driver.py
         DRC=$?
         set -e
@@ -161,6 +176,10 @@ runs:
           cat "$WORK/results/stdout" 2>/dev/null || true
           echo 'GUEST_STDOUT_EOF'
         } >> "$GITHUB_OUTPUT"
+        if ls "$WORK"/results/*.ppm >/dev/null 2>&1; then
+          echo "guest screendumps saved (upload $WORK/results as an artifact to see them):"
+          ls -1 "$WORK"/results/*.ppm
+        fi
         docker rm -f macos-x64 >/dev/null 2>&1 || true
         exit "$DRC"
       env:
@@ -169,5 +188,8 @@ runs:
         CORES: ${{ inputs.cores }}
         THREADS: ${{ inputs.threads }}
         COLLECT: ${{ inputs.collect }}
+        START_TIMEOUT: ${{ inputs.start-timeout }}
+        NO_PROGRESS_TIMEOUT: ${{ inputs.no-progress-timeout }}
+        TERMINAL_ATTEMPTS: ${{ inputs.terminal-attempts }}
         BOOT_TIMEOUT: ${{ inputs.boot-timeout }}
         RUN_TIMEOUT: ${{ inputs.run-timeout }}
