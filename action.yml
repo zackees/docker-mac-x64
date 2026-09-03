@@ -37,9 +37,9 @@ inputs:
     required: false
     default: ''
   start-timeout:
-    description: 'Seconds a typed command gets to prove it reached a shell before the driver retries it'
+    description: 'Seconds a typed command gets to prove it reached a shell before the driver retries it. Only covers guest-side work (DHCP + fetch + POST), measured at ~10s.'
     required: false
-    default: '120'
+    default: '60'
   no-progress-timeout:
     description: 'Seconds a running guest script may produce no new output before the driver gives up'
     required: false

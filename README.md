@@ -265,8 +265,17 @@ Measured against a guest where Terminal deliberately never opens:
 
 | | before | after |
 |---|---|---|
-| time to report the failure | ~68 min (3600 s + 4x120 s) | **~7.5 min** (3x148 s) |
-| diagnostics | none | 3 screendumps naming the window that ate the keys |
+| shortcut never registers | ~68 min (3600 s + 4x120 s) | **~1 min** — caught by check 1, no typing |
+| Terminal opens but keys still miss | ~68 min | **~5 min** (3 x ~95 s) |
+| diagnostics | none | a screendump per miss, naming the window that ate the keys |
+
+The budget is almost entirely `start-timeout` x `terminal-attempts`; everything
+else in an attempt is ~35 s (repaint poll, 13 s of typing at 0.12 s/key, and the
+screendumps). `start-timeout` defaults to 60 s and its clock starts *after*
+typing, so it only has to cover guest-side work — DHCP, the `curl` retry loop,
+and the POST. That is ~10 s measured, and a GitHub runner is no slower than a
+local one here (35.6 s vs 35.5 s end-to-end before the repaint poll shortened
+both to ~25 s), so 60 s is ~6x headroom rather than a guess.
 
 ### Two things that make headless boot reliable
 

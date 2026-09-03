@@ -32,10 +32,15 @@ COLLECT = os.environ.get("COLLECT", "").strip()
 # budget before the first retry (issue #1: 3600 s of nothing). These split it:
 #   START_TIMEOUT       how long a typed command gets to prove it ran at all
 #   NO_PROGRESS_TIMEOUT how long a *running* script may produce no new output
-START_TIMEOUT = int(os.environ.get("START_TIMEOUT", "120"))
+# 60s, not 120: the clock starts AFTER typing, so it only has to cover the
+# guest-side work (DHCP, the curl retry loop, the POST). Measured at ~10.5s, and
+# identical on a GitHub runner (35.6s) to this host (35.5s) once the 12s sleep
+# and 13.1s of typing are subtracted -- so this is ~6x headroom, not 11x.
+START_TIMEOUT = int(os.environ.get("START_TIMEOUT", "60"))
 NO_PROGRESS_TIMEOUT = int(os.environ.get("NO_PROGRESS_TIMEOUT", "900"))
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "20"))
 ATTEMPTS = int(os.environ.get("TERMINAL_ATTEMPTS", "3"))
+TERMINAL_OPEN_TIMEOUT = int(os.environ.get("TERMINAL_OPEN_TIMEOUT", "15"))
 SHOT = "/tmp/_drv.ppm"
 
 # Measured framebuffer signatures (mean brightness of the PPM payload).
@@ -441,10 +446,19 @@ def main():
         mon.screendump()
         _, _, _, before = ppm_stats(SHOT)
         mon.key("shift-meta_l-t")
-        time.sleep(12)
-        mon.screendump()
-        _, _, _, after = ppm_stats(SHOT)
-        if before and after and before == after:
+        # Poll for the repaint rather than sleeping a fixed 12s: Terminal
+        # usually appears in ~2s, and on the miss path this still bounds the
+        # wait, so it is faster on success without being less careful on failure.
+        opened = False
+        poll_until = time.time() + TERMINAL_OPEN_TIMEOUT
+        while time.time() < poll_until:
+            time.sleep(2)
+            mon.screendump()
+            _, _, _, after = ppm_stats(SHOT)
+            if before and after and before != after:
+                opened = True
+                break
+        if not opened:
             shot = os.path.join(OUT, "no-terminal-attempt-%d.ppm" % attempt)
             mon.screendump(shot)
             log("  Terminal did not open (screen unchanged); NOT typing, to avoid "
