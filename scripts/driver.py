@@ -10,6 +10,36 @@ files QEMU writes -- no ImageMagick, no bc, no docker round-trips per poll.
 Result channel is a POST back from the guest rather than screen-scraping: the
 guest uploads stdout and the real exit code, and the arrival of that POST is
 also how we know the GUI Terminal actually took our keystrokes.
+
+What counts as "progress" for NO_PROGRESS_TIMEOUT
+-------------------------------------------------
+The guest wrapper runs the user script as `sh /tmp/user.sh > /tmp/out 2>&1`
+and a background loop POSTs `tail -c 4000 /tmp/out` to /heartbeat every
+HEARTBEAT_INTERVAL seconds. Host-side, progress is *the arrival of a heartbeat
+POST*: every POST rewrites OUT_DIR/heartbeat, and the driver watches that
+file's mtime. The heartbeat body is only echoed into the driver log; it is not
+compared. Consequences the guest script author must know:
+
+  * Output from the user script is only visible if it reaches the script's
+    own stdout/stderr (i.e. /tmp/out). A stage that redirects its output to a
+    file (`cmd > log 2>&1`) contributes nothing to the heartbeat tail; the
+    driver's log will keep repeating the last line that DID reach /tmp/out.
+  * The liveness signal is the heartbeat loop itself, not the script's
+    output. As long as the loop keeps POSTing, the driver treats the guest
+    as alive even if /tmp/out has not changed. A stall verdict therefore
+    means the POSTs stopped arriving for NO_PROGRESS_TIMEOUT seconds, which
+    is either a dead heartbeat loop, a dead guest, or a guest that cannot
+    reach 10.0.2.2 any more -- not merely a quiet script.
+  * Each heartbeat curl is bounded by HEARTBEAT_MAX_TIME (15 s). A POST that
+    times out is dropped and the loop moves on; the host sees that as no
+    progress for that interval, never as a wedged loop.
+
+On a stall the driver exits 7, but first (a) screendumps fail.ppm and (b)
+makes a bounded, best-effort attempt to pull results out of the still-running
+guest: it opens a second Terminal window (Cmd-N), runs /tmp/collect.sh there
+(tar of COLLECT -> /collect.tar.gz, then /tmp/out -> /stdout), and waits up to
+STALL_COLLECT_TIMEOUT seconds for those POSTs. Whatever arrives lands in
+OUT_DIR exactly as it would on the success path.
 """
 import os
 import re
@@ -39,6 +69,12 @@ COLLECT = os.environ.get("COLLECT", "").strip()
 START_TIMEOUT = int(os.environ.get("START_TIMEOUT", "60"))
 NO_PROGRESS_TIMEOUT = int(os.environ.get("NO_PROGRESS_TIMEOUT", "900"))
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "20"))
+# Bound on each heartbeat POST. Without it one hung curl (slirp user-net, a
+# busy host HTTP server) parks the loop forever and the host reads a healthy
+# guest as a stall (soldr#3097). A dropped POST just costs one interval.
+HEARTBEAT_MAX_TIME = int(os.environ.get("HEARTBEAT_MAX_TIME", "15"))
+# How long the stall path waits for the best-effort collect to POST back.
+STALL_COLLECT_TIMEOUT = int(os.environ.get("STALL_COLLECT_TIMEOUT", "120"))
 ATTEMPTS = int(os.environ.get("TERMINAL_ATTEMPTS", "3"))
 TERMINAL_OPEN_TIMEOUT = int(os.environ.get("TERMINAL_OPEN_TIMEOUT", "15"))
 SHOT = "/tmp/_drv.ppm"
@@ -335,62 +371,189 @@ def boot_to_desktop(mon, attempts=3):
     return False
 
 
+def collect_script(port=PORT, collect=COLLECT):
+    """Guest-side collector, shared by the success path and the stall path.
+
+    Tars COLLECT (if any) and POSTs it, then POSTs /tmp/out as stdout. Every
+    curl is bounded so a wedged network cannot hang the caller.
+    """
+    lines = ["#!/bin/sh"]
+    if collect:
+        lines += [
+            "tar -czf /tmp/collect.tar.gz -C {c} . 2>/dev/null || true".format(c=collect),
+            "curl -s --max-time 300 -X POST --data-binary @/tmp/collect.tar.gz "
+            "http://10.0.2.2:{p}/collect.tar.gz || true".format(p=port),
+        ]
+    lines += [
+        "curl -s --max-time 120 -X POST --data-binary @/tmp/out "
+        "http://10.0.2.2:{p}/stdout || true".format(p=port),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def run_script(port=PORT, collect=COLLECT, interval=HEARTBEAT_INTERVAL,
+               hb_max_time=HEARTBEAT_MAX_TIME):
+    """Guest-side wrapper: capture output + real rc, then POST both back.
+
+    Recovery ships bash 3.2 -- keep this portable /bin/sh.
+    """
+    lines = [
+        "#!/bin/sh",
+        # FIRST, before anything that can fail: proof the typed line reached
+        # a shell. Without this the driver cannot tell a typing miss from a
+        # slow payload, which is issue #1.
+        "curl -s -X POST --data-binary started "
+        "http://10.0.2.2:{p}/started".format(p=port),
+        "curl -s -o /tmp/user.sh http://10.0.2.2:{p}/user.sh || exit 90".format(p=port),
+        # The collector is fetched up front so the stall path can run it from
+        # a second Terminal window even when this script never finishes.
+        "curl -s -o /tmp/collect.sh http://10.0.2.2:{p}/collect.sh || true".format(p=port),
+        # Background heartbeat carrying the tail of the live output, so a
+        # hang shows WHICH step stopped instead of just going quiet. Each
+        # POST is bounded: a hung curl must cost one interval, not the loop.
+        # Its pid is recorded so a stall screendump can be attributed.
+        ": > /tmp/out",
+        "( while : ; do",
+        "    tail -c 4000 /tmp/out > /tmp/hb 2>/dev/null || : > /tmp/hb",
+        "    curl -s --max-time {m} -X POST --data-binary @/tmp/hb "
+        "http://10.0.2.2:{p}/heartbeat >/dev/null 2>&1 || true".format(
+            m=hb_max_time, p=port),
+        "    sleep {i}".format(i=interval),
+        "  done ) &",
+        "_hb=$!",
+        "echo $_hb > /tmp/hb.pid",
+        "sh /tmp/user.sh > /tmp/out 2>&1; echo $? > /tmp/rc",
+        "kill $_hb 2>/dev/null",
+        # Collect BEFORE rc: rc is what the driver waits on, so posting it
+        # first would race the tarball.
+        "sh /tmp/collect.sh 2>/dev/null || "
+        "curl -s -X POST --data-binary @/tmp/out http://10.0.2.2:{p}/stdout".format(p=port),
+        "curl -s -X POST --data-binary @/tmp/rc http://10.0.2.2:{p}/rc".format(p=port),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def write_guest_scripts(share=SHARE, run_script_path=RUN_SCRIPT):
+    with open(run_script_path) as f:
+        user_script = f.read()
+    with open(os.path.join(share, "user.sh"), "w") as f:
+        f.write(user_script)
+    with open(os.path.join(share, "collect.sh"), "w") as f:
+        f.write(collect_script())
+    with open(os.path.join(share, "run.sh"), "w") as f:
+        f.write(run_script())
+
+
+def wait_for_repaint(mon, keys, timeout, gap=2):
+    """Press `keys` and return True once the framebuffer differs from before.
+
+    A GUI shortcut can silently miss; typing after a miss lands in whatever
+    dialog has focus. So every keystroke that is supposed to open a window is
+    verified by its repaint before anything is typed into it.
+    """
+    mon.screendump()
+    _, _, _, before = ppm_stats(SHOT)
+    mon.key(keys)
+    poll_until = time.time() + timeout
+    while time.time() < poll_until:
+        time.sleep(gap)
+        mon.screendump()
+        _, _, _, after = ppm_stats(SHOT)
+        if before and after and before != after:
+            return True
+    return False
+
+
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def stall_collect(mon, out=OUT, collect=COLLECT, timeout=STALL_COLLECT_TIMEOUT,
+                  open_timeout=TERMINAL_OPEN_TIMEOUT):
+    """Best-effort pull of results from a guest whose script has stalled.
+
+    The stuck script owns the first Terminal window, so a second one is opened
+    with Cmd-N and /tmp/collect.sh is typed there. Returns a one-line summary
+    for the log; never raises. Whatever arrives is written to `out` by the
+    HTTP handler exactly as on the success path.
+    """
+    wanted = ["stdout"] + (["collect.tar.gz"] if collect else [])
+    before = {n: _mtime(os.path.join(out, n)) for n in wanted}
+    try:
+        if not wait_for_repaint(mon, "meta_l-n", open_timeout):
+            return "stall-collect: Cmd-N did not open a second Terminal; nothing collected"
+        mon.type("sh /tmp/collect.sh")
+        mon.key("ret")
+    except Exception as e:  # monitor socket gone, guest dead, ...
+        return "stall-collect: could not type the collect command (%s)" % e
+    deadline = time.time() + timeout
+    got = {}
+    while True:
+        for n in wanted:
+            p = os.path.join(out, n)
+            m = _mtime(p)
+            if n not in got and m is not None and m != before[n]:
+                got[n] = os.path.getsize(p)
+        if len(got) == len(wanted) or time.time() >= deadline:
+            break
+        time.sleep(2)
+    if not got:
+        return "stall-collect: nothing arrived within %ds" % timeout
+    parts = ["%s (%d bytes)" % (n, got[n]) for n in wanted if n in got]
+    missing = [n for n in wanted if n not in got]
+    s = "stall-collect: got " + ", ".join(parts)
+    if missing:
+        s += "; missing " + ", ".join(missing)
+    return s
+
+
+def wait_for_rc(mon, rc_path, hb_path, hb_tail, out=OUT, run_timeout=RUN_TIMEOUT,
+                no_progress_timeout=NO_PROGRESS_TIMEOUT, poll=2):
+    """Wait for the guest's rc POST: 'rc' | 'stalled' | 'timeout'.
+
+    Progress is the heartbeat file's mtime changing (see the module docstring
+    for what that does and does not mean). On a stall the screendump comes
+    first (the guest may be unrecoverable a moment later), then a bounded
+    best-effort collect so the failure carries the guest's own results
+    instead of only fail.ppm (soldr#3097). A plain RUN_TIMEOUT expiry is
+    'timeout' and stays the caller's "never posted a result" (exit 6).
+    """
+    deadline = time.time() + run_timeout
+    last_hb = None
+    last_change = time.time()
+    last_report = 0.0
+    while time.time() < deadline:
+        if os.path.exists(rc_path):
+            return "rc"
+        stamp = _mtime(hb_path)
+        if stamp != last_hb:
+            last_hb, last_change = stamp, time.time()
+        quiet = time.time() - last_change
+        if quiet > no_progress_timeout:
+            mon.screendump(os.path.join(out, "fail.ppm"))
+            log("FAIL: no output for %ds (last heartbeat: %s)"
+                % (int(quiet), hb_tail() or "<none>"))
+            log("  attempting a best-effort collect from the stalled guest "
+                "(up to %ds)" % STALL_COLLECT_TIMEOUT)
+            log("  " + stall_collect(mon, out=out))
+            return "stalled"
+        # Surface progress in the driver log, so a hang shows its last step.
+        if time.time() - last_report > 60:
+            last_report = time.time()
+            t = hb_tail()
+            if t:
+                log("  guest: %s" % t)
+        time.sleep(poll)
+    return "rc" if os.path.exists(rc_path) else "timeout"
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     os.makedirs(SHARE, exist_ok=True)
-
-    with open(RUN_SCRIPT) as f:
-        user_script = f.read()
-    with open(os.path.join(SHARE, "user.sh"), "w") as f:
-        f.write(user_script)
-    # Optional: tar a directory in the guest and POST it back, so results
-    # (JUnit XML, JSON) survive the guest being torn down. Sent BEFORE rc,
-    # because rc is what the driver waits on -- posting it last would race.
-    collect_snippet = ""
-    if COLLECT:
-        collect_snippet = (
-            "tar -czf /tmp/collect.tar.gz -C %s . 2>/dev/null || true\n"
-            "curl -s -X POST --data-binary @/tmp/collect.tar.gz "
-            "http://10.0.2.2:%d/collect.tar.gz || true\n" % (COLLECT, PORT)
-        )
-
-    # Guest-side wrapper: capture output + real rc, then POST both back.
-    # Recovery ships bash 3.2 -- keep this portable.
-    with open(os.path.join(SHARE, "run.sh"), "w") as f:
-        lines = [
-            "#!/bin/sh",
-            # FIRST, before anything that can fail: proof the typed line reached
-            # a shell. Without this the driver cannot tell a typing miss from a
-            # slow payload, which is issue #1.
-            "curl -s -X POST --data-binary started "
-            "http://10.0.2.2:{p}/started".format(p=PORT),
-            "curl -s -o /tmp/user.sh http://10.0.2.2:{p}/user.sh || exit 90".format(p=PORT),
-            # Background heartbeat carrying the tail of the live output, so a
-            # hang shows WHICH step stopped instead of just going quiet.
-            ": > /tmp/out",
-            "( while : ; do",
-            "    tail -c 4000 /tmp/out > /tmp/hb 2>/dev/null || : > /tmp/hb",
-            "    curl -s -X POST --data-binary @/tmp/hb "
-            "http://10.0.2.2:{p}/heartbeat".format(p=PORT),
-            "    sleep {i}".format(i=HEARTBEAT_INTERVAL),
-            "  done ) &",
-            "_hb=$!",
-            "sh /tmp/user.sh > /tmp/out 2>&1; echo $? > /tmp/rc",
-            "kill $_hb 2>/dev/null",
-        ]
-        if COLLECT:
-            lines += [
-                "tar -czf /tmp/collect.tar.gz -C {c} . 2>/dev/null || true".format(c=COLLECT),
-                "curl -s -X POST --data-binary @/tmp/collect.tar.gz "
-                "http://10.0.2.2:{p}/collect.tar.gz || true".format(p=PORT),
-            ]
-        lines += [
-            "curl -s -X POST --data-binary @/tmp/out http://10.0.2.2:{p}/stdout".format(p=PORT),
-            # rc goes LAST: it is what the driver waits on, so posting it before
-            # the collected results would race the tarball.
-            "curl -s -X POST --data-binary @/tmp/rc http://10.0.2.2:{p}/rc".format(p=PORT),
-        ]
-        f.write("\n".join(lines) + "\n")
+    write_guest_scripts()
 
     serve()
     mon = Monitor()
@@ -443,22 +606,10 @@ def main():
         # no-start screendump shows exactly that window). Opening Terminal
         # repaints a large part of the screen, so an unchanged frame means the
         # shortcut did not register and typing would do harm.
-        mon.screendump()
-        _, _, _, before = ppm_stats(SHOT)
-        mon.key("shift-meta_l-t")
         # Poll for the repaint rather than sleeping a fixed 12s: Terminal
         # usually appears in ~2s, and on the miss path this still bounds the
         # wait, so it is faster on success without being less careful on failure.
-        opened = False
-        poll_until = time.time() + TERMINAL_OPEN_TIMEOUT
-        while time.time() < poll_until:
-            time.sleep(2)
-            mon.screendump()
-            _, _, _, after = ppm_stats(SHOT)
-            if before and after and before != after:
-                opened = True
-                break
-        if not opened:
+        if not wait_for_repaint(mon, "shift-meta_l-t", TERMINAL_OPEN_TIMEOUT):
             shot = os.path.join(OUT, "no-terminal-attempt-%d.ppm" % attempt)
             mon.screendump(shot)
             log("  Terminal did not open (screen unchanged); NOT typing, to avoid "
@@ -498,32 +649,8 @@ def main():
 
     # It is running. Wait for rc, but give up if it stops producing output --
     # a wedged payload should not consume the whole RUN_TIMEOUT in silence.
-    deadline = time.time() + RUN_TIMEOUT
-    last_hb = None
-    last_change = time.time()
-    last_report = 0.0
-    while time.time() < deadline:
-        if os.path.exists(rc_path):
-            break
-        try:
-            stamp = os.path.getmtime(hb_path)
-        except OSError:
-            stamp = None
-        if stamp != last_hb:
-            last_hb, last_change = stamp, time.time()
-        quiet = time.time() - last_change
-        if quiet > NO_PROGRESS_TIMEOUT:
-            mon.screendump(os.path.join(OUT, "fail.ppm"))
-            log("FAIL: no output for %ds (last heartbeat: %s)"
-                % (int(quiet), hb_tail() or "<none>"))
-            return 7
-        # Surface progress in the driver log, so a hang shows its last step.
-        if time.time() - last_report > 60:
-            last_report = time.time()
-            t = hb_tail()
-            if t:
-                log("  guest: %s" % t)
-        time.sleep(2)
+    if wait_for_rc(mon, rc_path, hb_path, hb_tail) == "stalled":
+        return 7
 
     mon.screendump(os.path.join(OUT, "final.ppm"))
     if not os.path.exists(rc_path):

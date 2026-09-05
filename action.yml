@@ -41,7 +41,7 @@ inputs:
     required: false
     default: '60'
   no-progress-timeout:
-    description: 'Seconds a running guest script may produce no new output before the driver gives up'
+    description: 'Seconds the guest heartbeat may stop arriving before the driver gives up (exit 7). Progress is the heartbeat POST itself, not script output -- see README. On a stall the driver still attempts a bounded best-effort collect of `collect` and stdout.'
     required: false
     default: '900'
   terminal-attempts:
@@ -65,7 +65,7 @@ outputs:
     description: 'Stdout+stderr captured inside the guest'
     value: ${{ steps.drive.outputs.stdout }}
   workdir:
-    description: 'Directory holding results/ (stdout, rc, final.ppm, fail.ppm)'
+    description: 'Directory holding results/ (stdout, rc, final.ppm, fail.ppm; on a stall also whatever the best-effort collect pulled back)'
     value: ${{ steps.prep.outputs.workdir }}
 
 runs:

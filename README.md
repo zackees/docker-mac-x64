@@ -256,6 +256,34 @@ Three changes, in order of how much they help:
    out the full `run-timeout` in silence, and the tail is echoed into the driver
    log so a hang shows *which step* it stopped at.
 
+#### What "progress" means, exactly
+
+The driver's liveness signal is **the arrival of a heartbeat POST**, not the
+content of your script's output. The guest wrapper runs your script as
+`sh /tmp/user.sh > /tmp/out 2>&1`; every 20 s a background loop POSTs
+`tail -c 4000 /tmp/out`, and the driver counts each POST (the mtime of
+`results/heartbeat` changing) as progress. So:
+
+- A script that is silent for an hour is still "making progress" as long as
+  the loop keeps POSTing. `no-progress-timeout` fires only when the POSTs
+  themselves stop for that long — a dead heartbeat loop, a dead guest, or a
+  guest that lost `10.0.2.2`.
+- Only output that reaches your script's own stdout/stderr shows up in the
+  heartbeat tail and the driver log. A stage that redirects to a file
+  (`cmd > log 2>&1`) is invisible; the driver log keeps repeating the last line
+  that did reach `/tmp/out`. `tee` it if you want the running step named.
+- Each heartbeat `curl` is bounded (`--max-time 15`). A POST that times out is
+  dropped and costs one interval; it can no longer wedge the loop itself
+  ([soldr#3097](https://github.com/zackees/soldr/issues/3097)).
+
+When the driver does give up on a stall it exits 7 with `results/fail.ppm`,
+and first makes a bounded, best-effort collect from the still-running guest:
+it opens a second Terminal window (⌘N), runs `/tmp/collect.sh` there — the
+same collector the success path uses (`tar` of `collect` -> `collect.tar.gz`,
+then `/tmp/out` -> `stdout`) — and waits up to `STALL_COLLECT_TIMEOUT` (120 s)
+for the POSTs. The driver log says what arrived and what did not; anything
+that did is unpacked into `<workdir>/collected/` exactly as on success.
+
 Retries stop once the script has provably started — retyping a command at a
 guest that is already half-way through a run only makes it worse. Every miss
 writes a `.ppm` screendump to `<workdir>/results/`; upload that directory as an
