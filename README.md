@@ -276,6 +276,17 @@ content of your script's output. The guest wrapper runs your script as
   dropped and costs one interval; it can no longer wedge the loop itself
   ([soldr#3097](https://github.com/zackees/soldr/issues/3097)).
 
+Host receipt evidence is also saved in `results/heartbeat-history.jsonl`:
+UTC Unix receipt time, monotonic receipt time, original body size, and the
+last 4,000 bytes of each heartbeat. A rotated
+`results/heartbeat-history.previous.jsonl` retains the previous generation;
+each file is bounded to 4 MiB. An incomplete trailing record from a failed
+append is discarded before the next append. Upload
+`results/` even when guest collection fails. These samples show the last
+received resource/test output and transport gaps; they are not a full guest
+log or proof of the cause of a freeze. A journal write failure is reported
+and does not prevent heartbeat acknowledgement.
+
 When the driver does give up on a stall it exits 7 with `results/fail.ppm`,
 and first makes a bounded, best-effort collect from the still-running guest:
 it opens a second Terminal window (⌘N), runs `/tmp/collect.sh` there — the
