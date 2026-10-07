@@ -41,6 +41,7 @@ guest: it opens a second Terminal window (Cmd-N), runs /tmp/collect.sh there
 STALL_COLLECT_TIMEOUT seconds for those POSTs. Whatever arrives lands in
 OUT_DIR exactly as it would on the success path.
 """
+import json
 import os
 import re
 import socket
@@ -73,6 +74,10 @@ HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "20"))
 # busy host HTTP server) parks the loop forever and the host reads a healthy
 # guest as a stall (soldr#3097). A dropped POST just costs one interval.
 HEARTBEAT_MAX_TIME = int(os.environ.get("HEARTBEAT_MAX_TIME", "15"))
+# Keep two bounded generations of received evidence even when a frozen guest
+# cannot run the collector. The latest heartbeat file remains the liveness clock.
+HEARTBEAT_HISTORY_MAX_BYTES = 4 * 1024 * 1024
+HEARTBEAT_HISTORY_TAIL_BYTES = 4000
 # How long the stall path waits for the best-effort collect to POST back.
 STALL_COLLECT_TIMEOUT = int(os.environ.get("STALL_COLLECT_TIMEOUT", "120"))
 ATTEMPTS = int(os.environ.get("TERMINAL_ATTEMPTS", "3"))
@@ -211,6 +216,59 @@ def ppm_stats(path):
 
 
 # ------------------------------------------------------------------- http ---
+def _repair_heartbeat_history(path):
+    """Discard a torn final record after a failed append; return valid bytes."""
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r+b") as stream:
+        end = stream.seek(0, os.SEEK_END)
+        if not end:
+            return 0
+        stream.seek(end - 1)
+        if stream.read(1) == b"\n":
+            return end
+        # Read backwards in bounded chunks instead of loading the journal.
+        cursor = end
+        while cursor:
+            start = max(0, cursor - 4096)
+            stream.seek(start)
+            block = stream.read(cursor - start)
+            newline = block.rfind(b"\n")
+            if newline >= 0:
+                end = start + newline + 1
+                break
+            cursor = start
+        else:
+            end = 0
+        stream.truncate(end)
+        return end
+
+
+def record_heartbeat(body):
+    """Append bounded host receipt evidence; preserve complete JSONL records.
+
+    received_at is Unix time in UTC; received_monotonic lets analysis measure
+    transport gaps even when the host wall clock moves. Rotation retains at
+    most two 4 MiB files. This is diagnostic storage, not the progress clock.
+    """
+    record = {
+        "received_at": time.time(),
+        "received_monotonic": time.monotonic(),
+        "body_bytes": len(body),
+        "tail": body[-HEARTBEAT_HISTORY_TAIL_BYTES:].decode("utf-8", errors="replace"),
+    }
+    line = (json.dumps(record, ensure_ascii=True) + "\n").encode("utf-8")
+    if len(line) > HEARTBEAT_HISTORY_MAX_BYTES:
+        raise OSError("heartbeat history record exceeds the journal budget")
+    path = os.path.join(OUT, "heartbeat-history.jsonl")
+    previous = os.path.join(OUT, "heartbeat-history.previous.jsonl")
+    size = _repair_heartbeat_history(path)
+    if size + len(line) > HEARTBEAT_HISTORY_MAX_BYTES:
+        os.replace(path, previous)
+    with open(path, "ab") as stream:
+        stream.write(line)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -242,6 +300,13 @@ class Handler(BaseHTTPRequestHandler):
             name = "post"
         with open(os.path.join(OUT, name), "wb") as f:
             f.write(body)
+        if name == "heartbeat":
+            try:
+                record_heartbeat(body)
+            except OSError as error:
+                # A full diagnostics disk must not suppress acknowledgement or
+                # turn a live guest into a heartbeat timeout.
+                log("heartbeat history unavailable: %s" % error)
         self.send_response(200)
         self.send_header("Content-Length", "2")
         self.end_headers()
